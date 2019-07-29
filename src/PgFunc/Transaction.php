@@ -21,7 +21,7 @@ namespace PgFunc {
         private static $savepoints = [];
 
         /**
-         * @var PDO Current connection.
+         * @var \Doctrine\DBAL\Connection Current connection.
          */
         private $db;
 
@@ -43,10 +43,10 @@ namespace PgFunc {
         /**
          * Initialize transaction.
          *
-         * @param PDO $db Current connection.
+         * @param \Doctrine\DBAL\Connection $db Current connection.
          * @param string $connectionId Unique connection ID.
          */
-        final public function __construct(PDO $db, $connectionId) {
+        final public function __construct(\Doctrine\DBAL\Connection $db, $connectionId) {
             $this->db = $db;
             $this->connectionId = (string) $connectionId;
             $this->begin();
@@ -92,8 +92,9 @@ namespace PgFunc {
 
         /**
          * Commit transaction or release savepoint.
-         *
          * @return bool Command was really invoked.
+         * @throws Database
+         * @throws \Doctrine\DBAL\DBALException
          */
         final public function commit() {
             if ($this->savepointId) {
@@ -105,8 +106,9 @@ namespace PgFunc {
 
         /**
          * Rollback transaction or savepoint.
-         *
          * @return bool Command was really invoked.
+         * @throws Database
+         * @throws \Doctrine\DBAL\DBALException
          */
         final public function rollback() {
             if ($this->savepointId) {
@@ -124,9 +126,11 @@ namespace PgFunc {
          *
          * @param string $name Setting name.
          * @param mixed $value Setting value (null means default value).
+         *
          * @return self
-         * @throws Usage When transaction is inactive.
          * @throws Database When query fails.
+         * @throws Usage When transaction is inactive.
+         * @throws \Doctrine\DBAL\DBALException
          */
         final public function setLocal($name, $value = null) {
             $isActiveTransaction = $this->savepointId
@@ -192,7 +196,10 @@ namespace PgFunc {
          * Commit or rollback transaction.
          *
          * @param string $query SQL statement for querying.
+         *
          * @return bool Command was really invoked.
+         * @throws Database
+         * @throws \Doctrine\DBAL\DBALException
          */
         private function finalizeTransaction($query) {
             if (! isset(self::$savepoints[$this->connectionId][$this->transactionId])) {
@@ -209,7 +216,10 @@ namespace PgFunc {
          *
          * @param string $query SQL statement for querying.
          * @param int $currentSavepointId Minimal savepoint ID for dropping.
+         *
          * @return bool Command was really invoked.
+         * @throws Database
+         * @throws \Doctrine\DBAL\DBALException
          */
         private function finalizeSavepoint($query, $currentSavepointId) {
             if (empty(self::$savepoints[$this->connectionId][$this->transactionId][$this->savepointId])) {
@@ -234,7 +244,7 @@ namespace PgFunc {
          */
         private function isTransaction() {
             try {
-                return $this->db->inTransaction();
+                return $this->db->isTransactionActive();
             } catch (PDOException $exception) {
                 throw new Database('Error getting transaction state', Exception::TRANSACTION_ERROR, $exception);
             }
@@ -244,7 +254,9 @@ namespace PgFunc {
          * Query SQL statement.
          *
          * @param string $query SQL statement for querying.
+         *
          * @throws Database When query fails.
+         * @throws \Doctrine\DBAL\DBALException
          */
         private function query($query) {
             try {

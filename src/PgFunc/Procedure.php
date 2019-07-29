@@ -47,9 +47,9 @@ namespace PgFunc {
         private $returnType = self::RETURN_VOID;
 
         /**
-         * @var callable[] Callbacks for modifying rows of result set.
+         * @var callable|null Callback for modifying rows of result set.
          */
-        private $resultCallbacks = [];
+        private $resultCallback;
 
         /**
          * @var callable|null Callback for identifying rows of result set.
@@ -179,24 +179,15 @@ namespace PgFunc {
          * @return self
          */
         final public function setResultCallback(callable $resultCallback) {
-            $this->resultCallbacks = [$resultCallback];
+            $this->resultCallback = $resultCallback;
             return $this;
         }
 
         /**
-         * @param callable $resultCallback Callback for modifying rows of result set.
-         * @return self
+         * @return callable|null Callback for modifying rows of result set.
          */
-        final public function addResultCallback(callable $resultCallback) {
-            $this->resultCallbacks[] = $resultCallback;
-            return $this;
-        }
-
-        /**
-         * @return callable[] Callbacks for modifying rows of result set.
-         */
-        final public function getResultCallbacks() {
-            return $this->resultCallbacks;
+        final public function getResultCallback() {
+            return $this->resultCallback;
         }
 
         /**
@@ -504,7 +495,7 @@ namespace PgFunc {
             $index = 0;
             foreach ($this->data as $name => $value) {
                 $sql = $this->generateSqlValue($value, $this->parameters[$name], 'p' . $index, true);
-                $sql = is_int($name) ? $sql : ($name . ':=' . $sql);
+                $sql = is_int($name) ? $sql : ($name . '=>' . $sql);
                 if ($name === $this->variadic) {
                     $sql = 'VARIADIC ' . $sql;
                 }

@@ -1,8 +1,13 @@
 <?php
 namespace PgFunc {
+
+    use Doctrine\DBAL\Connection as DBALConnection;
+    use Doctrine\DBAL\DBALException;
+    use Doctrine\DBAL\Driver\PDOConnection;
+    use Doctrine\DBAL\DriverManager;
+    use Doctrine\DBAL\Statement;
+    use Doctrine\DBAL\TransactionIsolationLevel;
     use PDO;
-    use PDOException;
-    use PDOStatement;
     use PgFunc\Exception\Database;
     use PgFunc\Exception\Specified;
     use PgFunc\Exception\Usage;
@@ -20,7 +25,7 @@ namespace PgFunc {
         use AttemptsCount, JsonResult, LocalParams;
 
         /**
-         * @var PDO Current connection.
+         * @var \Doctrine\DBAL\Connection Current connection.
          */
         private $db;
 
@@ -39,13 +44,40 @@ namespace PgFunc {
          */
         private $isTransactionEnabled;
 
+        /** @var \Doctrine\DBAL\Configuration */
+        private $doctrineConf;
+
+        /** @var DBALConnection */
+        private $doctrine;
+
+        /**
+         * @var bool
+         */
+        private $isSerializeNextExecute = false;
+
         /**
          * Initialize connection.
          *
          * @param Configuration $configuration
+         * @param DBALConnection|null $doctrine
+         *
+         * @throws Database
+         * @throws \Doctrine\DBAL\DBALException
          */
-        final public function __construct(Configuration $configuration) {
+        final public function __construct(Configuration $configuration, DBALConnection $doctrine = null) {
+
+            if (null !== $doctrine) {
+                $this->db = clone $doctrine;
+                $this->db->setFetchMode(PDO::FETCH_NUM);
+                $this->doctrineConf = $doctrine->getConfiguration();
+                $configuration->setHost($doctrine->getHost());
+                $configuration->setPort($doctrine->getPort());
+                $configuration->setDbName($doctrine->getDatabase());
+                $configuration->setUser($doctrine->getUsername());
+                $configuration->setPassword($doctrine->getPassword());
+            }
             $this->configuration = clone $configuration;
+
             $this->isTransactionEnabled = $configuration->isTransactionEnabled();
 
             $this->queryAttemptsCount = $configuration->getQueryAttemptsCount();
@@ -71,11 +103,22 @@ namespace PgFunc {
         }
 
         /**
+         * Set flag to serialize next statement execution
+         */
+        public function serializeNextExecute() : void
+        {
+            $this->isSerializeNextExecute = true;
+        }
+
+        /**
          * Running stored procedure.
          *
          * @param Procedure $procedure
+         *
          * @return mixed Result of procedure call.
-         * @throws Exception
+         * @throws Database
+         * @throws Specified
+         * @throws Usage
          */
         final public function queryProcedure(Procedure $procedure) {
             list ($sql, $parameters) = $procedure->generateQueryData();
@@ -129,19 +172,24 @@ namespace PgFunc {
             $this->connectionId = md5(microtime()) . '_' . $connectionId++;
 
             try {
-                $attributes = $this->configuration->getAttributes();
-                $this->db = new PDO(
-                    $this->configuration->getDsn(),
-                    $this->configuration->getUser(),
-                    $this->configuration->getPassword(),
-                    $attributes
-                );
+                // Back compatibility for pure PDO extension
+                // It will wrap pure PDO to DBAL
+                if (null === $this->db) {
+                    $attributes = $this->configuration->getAttributes();
+                    $pdo = new PDOConnection(
+                        $this->configuration->getDsn(),
+                        $this->configuration->getUser(),
+                        $this->configuration->getPassword(),
+                        $attributes
+                    );
+                    // Discard current state of broken persistent connection.
+                    if (! empty($attributes[PDO::ATTR_PERSISTENT]) && $pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
 
-                // Discard current state of broken persistent connection.
-                if (! empty($attributes[PDO::ATTR_PERSISTENT]) && $this->db->inTransaction()) {
-                    $this->db->rollBack();
+                    $this->db = DriverManager::getConnection(['pdo' => $pdo], $this->doctrineConf);
                 }
-            } catch (PDOException $exception) {
+            } catch (DBALException $exception) {
                 throw new Database(
                     'Failed to connect to database: ' . $exception->getMessage(),
                     Exception::FAILED_CONNECT,
@@ -171,13 +219,14 @@ namespace PgFunc {
          * Prepare statement object.
          *
          * @param string $sql SQL statement.
-         * @return PDOStatement Prepared statement.
+         *
+         * @return Statement Prepared statement.
          * @throws Database When preparing is failed.
          */
         private function getStatement($sql) {
             try {
                 return $this->db->prepare($sql);
-            } catch (PDOException $exception) {
+            } catch (DBALException $exception) {
                 throw new Database('Failed to prepare statement: ' . $sql, Exception::FAILED_PREPARE, $exception);
             }
         }
@@ -185,16 +234,16 @@ namespace PgFunc {
         /**
          * Bind parameters of prepared statement.
          *
-         * @param PDOStatement $statement Prepared statement.
+         * @param Statement $statement Prepared statement.
          * @param array $params Parameters for binding.
          * @throws Database When binding is failed.
          */
-        private function bindParams(PDOStatement $statement, array $params) {
+        private function bindParams(Statement $statement, array $params) {
             try {
                 foreach ($params as $name => $value) {
                     $statement->bindValue($name, $value, $this->getFlags($value));
                 }
-            } catch (PDOException $exception) {
+            } catch (DBALException $exception) {
                 throw new Database('Failed to bind parameter: ' . $name, Exception::FAILED_BIND, $exception);
             }
         }
@@ -202,7 +251,7 @@ namespace PgFunc {
         /**
          * Get mask of flags for bindValue() call.
          *
-         * @see PDOStatement::bindValue()
+         * @see Statement::bindValue()
          *
          * @param mixed $value Parameter value.
          * @return int
@@ -215,7 +264,8 @@ namespace PgFunc {
                 case is_bool($value):
                     return PDO::PARAM_BOOL;
 
-                case is_int($value);
+                case is_int($value):
+                case is_float($value):
                     return PDO::PARAM_INT;
 
                 case is_resource($value):
@@ -229,17 +279,28 @@ namespace PgFunc {
         /**
          * Execute prepared statement of stored procedure call.
          *
-         * @param PDOStatement $statement
+         * @param Statement $statement
          * @param Procedure $procedure
+         *
          * @return Database|null Database exception in case of error.
          * @throws Database When executing is failed.
          * @throws Specified When database exception is known and specified.
          */
-        private function executeStatement(PDOStatement $statement, Procedure $procedure) {
+        private function executeStatement(Statement $statement, Procedure $procedure) {
             try {
+                if (!$this->isSerializeNextExecute) {
+                    $statement->execute();
+                    return null;
+                }
+
+                $defaultIsolationLevel = $this->db->getTransactionIsolation();
+                $this->db->setTransactionIsolation(TransactionIsolationLevel::SERIALIZABLE);
                 $statement->execute();
+                $this->db->setTransactionIsolation($defaultIsolationLevel);
+                $this->isSerializeNextExecute = false;
+
                 return null;
-            } catch (PDOException $exception) {
+            } catch (DBALException $exception) {
                 return $this->handleException($exception, $procedure);
             }
         }
@@ -247,29 +308,30 @@ namespace PgFunc {
         /**
          * Get result of stored procedure call.
          *
-         * @param PDOStatement $statement
+         * @param Statement $statement
          * @param Procedure $procedure
          * @return mixed Result of procedure call.
          */
-        private function fetchResult(PDOStatement $statement, Procedure $procedure) {
+        private function fetchResult(Statement $statement, Procedure $procedure) {
             if ($procedure->getReturnType() === Procedure::RETURN_VOID) {
                 return null;
             }
 
             $isSingleRow = $procedure->getReturnType() === Procedure::RETURN_SINGLE;
+            $resultCallback = $procedure->getResultCallback();
             $resultIdentifierCallback = $procedure->getResultIdentifierCallback();
             $isJsonAsArray = $this->prepareIsJsonAsArray($procedure);
             $result = [];
             foreach ($statement as $data) {
                 $data = json_decode($data[0], $isJsonAsArray);
                 if ($isSingleRow) {
-                    return $this->applyResultCallbacks($procedure, $data);
+                    return $resultCallback ? $resultCallback($data) : $data;
                 }
 
                 if ($resultIdentifierCallback) {
-                    $result[$resultIdentifierCallback($data)] = $this->applyResultCallbacks($procedure, $data);
+                    $result[$resultIdentifierCallback($data)] = $resultCallback ? $resultCallback($data) : $data;
                 } else {
-                    $result[] = $this->applyResultCallbacks($procedure, $data);
+                    $result[] = $resultCallback ? $resultCallback($data) : $data;
                 }
             }
             return $isSingleRow ? null : $result;
@@ -293,13 +355,14 @@ namespace PgFunc {
         /**
          * Handle PDO exception while executing statement.
          *
-         * @param PDOException $exception
+         * @param DBALException $exception
          * @param Procedure $procedure
+         *
          * @return Database Last database error.
          * @throws Database When executing is failed.
          * @throws Specified When database exception is known and specified.
          */
-        private function handleException(PDOException $exception, Procedure $procedure) {
+        private function handleException(DBALException $exception, Procedure $procedure) {
             $databaseException = new Database(
                 'Failed to execute statement: ' . $exception->getMessage(),
                 Exception::FAILED_QUERY,
@@ -360,19 +423,6 @@ namespace PgFunc {
                     throw $databaseException;
             }
             return $databaseException;
-        }
-
-        /**
-         * @param Procedure $procedure
-         * @param mixed $data Row of result set.
-         *
-         * @return mixed Modified row of result set.
-         */
-        private function applyResultCallbacks(Procedure $procedure, $data) {
-            foreach ($procedure->getResultCallbacks() as $resultCallback) {
-                $data = $resultCallback($data);
-            }
-            return $data;
         }
     }
 }
